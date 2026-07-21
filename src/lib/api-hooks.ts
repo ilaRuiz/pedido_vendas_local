@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { api, getCachedPayload, setCachedPayload } from "@/lib/api-client";
+import { api, getCachedPayload, getLargeCachedPayload, getParceirosCache, setCachedPayload } from "@/lib/api-client";
 
 // Utilitários pra normalizar as respostas heterogêneas do Firebird.
 export function pick<T = any>(obj: any, ...keys: string[]): T | undefined {
@@ -40,20 +40,59 @@ export function matchNormalizedTokens(normalizedHaystack: string, query: string)
  * grava no cache e retorna. Assim, após a primeira sincronização todo
  * o app passa a ler diretamente da tabela — muito mais rápido.
  */
-async function cachedFetch(rota: string, apiFn: () => Promise<any[]>) {
+async function cachedFetch(rota: string, apiFn: () => Promise<any[]>, allowApiFallback = true) {
   const cached = await getCachedPayload<any[]>(rota);
-  if (cached && cached.length > 0) return cached;
-  const fresh = await apiFn();
-  const arr = Array.isArray(fresh) ? fresh : [];
-  await setCachedPayload(rota, arr);
-  return arr;
+  // Compatibilidade com caches gravados por versões que armazenavam um
+  // envelope ({ data/rows/clientes/parceiros: [...] }) em vez do array.
+  const cachedList = extractList(cached);
+  if (cachedList.length > 0) return cachedList;
+
+  // A pesquisa de clientes deve depender somente do Supabase. Se ainda não
+  // houver carga nesse cache, retorna imediatamente sem aguardar o middleware.
+  if (!allowApiFallback) return [];
+
+  try {
+    const fresh = await apiFn();
+    const arr = extractList(fresh);
+    await setCachedPayload(rota, arr);
+    return arr;
+  } catch (error) {
+    // A pesquisa continua disponível com o último cache, mesmo sem o
+    // middleware local. Não transforma indisponibilidade da API em lista vazia.
+    if (cachedList.length > 0) return cachedList;
+    throw error;
+  }
+}
+
+function extractList(value: any): any[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try { return extractList(JSON.parse(value)); } catch { return []; }
+  }
+  if (!value || typeof value !== "object") return [];
+  for (const key of Object.keys(value)) {
+    if (Array.isArray(value[key])) return value[key];
+  }
+  for (const key of Object.keys(value)) {
+    const nested = extractList(value[key]);
+    if (nested.length > 0) return nested;
+  }
+  return [];
 }
 
 export function useParceiros() {
   return useQuery({
-    queryKey: ["cache", "/api/parceiros"],
-    queryFn: () => cachedFetch("/api/parceiros", api.parceiros),
-    staleTime: 5 * 60 * 1000,
+    // v2 invalida listas vazias mantidas no cache do navegador antes da
+    // sincronização dos parceiros no Supabase.
+    queryKey: ["parceiros-cache-v1"],
+    // A pesquisa de clientes é somente leitura no Supabase. O middleware não
+    // participa deste carregamento e, portanto, não pode bloquear a tela.
+    queryFn: async () => {
+      return getParceirosCache();
+    },
+    staleTime: Infinity,
+    gcTime: 30 * 60 * 1000,
+    retry: false,
   });
 }
 export function useParceirosPropriedade() {
@@ -72,8 +111,12 @@ export function useClienteDiversos() {
 }
 export function useEstoque() {
   return useQuery({
-    queryKey: ["cache", "/api/estoque"],
-    queryFn: () => cachedFetch("/api/estoque", api.estoque),
+    queryKey: ["estoque-cache-v2"],
+    queryFn: async () => {
+      const chunked = await getLargeCachedPayload("/api/estoque");
+      if (chunked.length > 0) return chunked;
+      return cachedFetch("/api/estoque", api.estoque);
+    },
     staleTime: 5 * 60 * 1000,
   });
 }
@@ -98,18 +141,27 @@ export function useOperacoes() {
     staleTime: 10 * 60 * 1000,
   });
 }
+export function useCidades() {
+  return useQuery({
+    queryKey: ["cache", "/api/cidades"],
+    queryFn: () => cachedFetch("/api/cidades", api.cidades),
+    staleTime: 60 * 60 * 1000,
+  });
+}
 
 
 export function parceiroId(p: any): string {
   return String(pick(p, "PARCEIRO", "ID_PARCEIRO", "id_parceiro", "CODIGO", "codigo", "id") ?? "");
 }
 export function parceiroNome(p: any): string {
-  return String(
+  const known = String(
     pick(p, "NOME", "nome", "FANTASIA", "fantasia", "RAZAO_SOCIAL", "razao_social") ?? "",
   );
+  if (known) return known;
+  return String(Object.values(p ?? {}).find((value) => typeof value === "string" && value.trim()) ?? "");
 }
 export function parceiroBusca(p: any): string {
-  return [
+  const known = [
     pick(p, "NOME", "nome"),
     pick(p, "FANTASIA", "fantasia"),
     pick(p, "RAZAO_SOCIAL", "razao_social", "APELIDO", "apelido"),
@@ -118,7 +170,8 @@ export function parceiroBusca(p: any): string {
     pick(p, "MUNICIPIO", "municipio", "CIDADE", "cidade"),
     pick(p, "CPF", "cpf", "CNPJ", "cnpj", "DOCUMENTO", "documento"),
     pick(p, "PARCEIRO"),
-  ]
+  ];
+  return [...known, ...Object.values(p ?? {})]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();

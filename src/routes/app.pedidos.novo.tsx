@@ -13,6 +13,7 @@ import {
   MapPin,
   Info,
   Check,
+  UserPlus,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,11 +44,13 @@ import { ClienteAutocomplete, isClienteDiversos } from "@/components/pedido/clie
 import { ProdutoAutocomplete } from "@/components/pedido/produto-autocomplete";
 import { ClienteDiversosDialog } from "@/components/pedido/cliente-diversos-dialog";
 import { ClienteCadastroDetalhesDialog } from "@/components/pedido/cliente-cadastro-detalhes-dialog";
+import { ClienteCadastroDialog } from "@/components/pedido/cliente-cadastro-dialog";
 import {
   useFormasPagamento,
   useCondicoesRecebimento,
   useOperacoes,
   useParceiros,
+  useClienteDiversos,
   parceiroId,
   parceiroNome,
   produtoId,
@@ -58,6 +61,7 @@ import {
   produtoUnidade,
   pick,
 } from "@/lib/api-hooks";
+import { apiCall } from "@/lib/api-client";
 import { formatBRL, parseDiasCondicao, simularParcelas } from "@/lib/format";
 import { useConfirm } from "@/components/ui/use-confirm";
 
@@ -204,6 +208,7 @@ function PedidoEditor({
   const [entregaOpen, setEntregaOpen] = useState(false);
   const [diversosOpen, setDiversosOpen] = useState(false);
   const [cadastroDetalhesOpen, setCadastroDetalhesOpen] = useState(false);
+  const [cadastroClienteOpen, setCadastroClienteOpen] = useState(false);
   const [parcelasOpen, setParcelasOpen] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -226,6 +231,7 @@ function PedidoEditor({
   const condsQ = useCondicoesRecebimento();
   const opsQ = useOperacoes();
   const parceirosQ = useParceiros();
+  const clienteDiversosQ = useClienteDiversos();
 
   const vendedores = useMemo(() => {
     const arr = parceirosQ.data ?? [];
@@ -423,6 +429,66 @@ function PedidoEditor({
 
     setSaving(true);
     try {
+      const dadosClienteDiversos = rascunho.clienteDiversos ? rascunho.clienteDiversosData ?? {} : undefined;
+      const parceiroDiversos = pick(
+        clienteDiversosQ.data?.[0],
+        "CODCLIENTEDIVERSOS",
+        "CLIENTE_DIVERSO",
+        "PARCEIRO",
+        "CODIGO",
+      );
+      const parceiroPedido = rascunho.clienteDiversos ? parceiroDiversos : rascunho.clienteId;
+      if (!parceiroPedido) {
+        throw new Error("Não foi possível identificar o código do cliente para gravar o pedido.");
+      }
+      const obsClienteDiversos = dadosClienteDiversos
+        ? [
+            `Cliente diversos: ${dadosClienteDiversos.nome ?? nomeCliente}`,
+            dadosClienteDiversos.cpf ? `CPF/CNPJ: ${dadosClienteDiversos.cpf}` : "",
+            dadosClienteDiversos.telefone ? `Telefone: ${dadosClienteDiversos.telefone}` : "",
+            [dadosClienteDiversos.endereco, dadosClienteDiversos.numero, dadosClienteDiversos.referencia]
+              .filter(Boolean)
+              .join(", "),
+            [dadosClienteDiversos.municipio, dadosClienteDiversos.uf].filter(Boolean).join("/"),
+          ].filter(Boolean).join(" | ")
+        : "";
+      const obsPedido = [rascunho.observacao, obsClienteDiversos].filter(Boolean).join("\n");
+      await apiCall("/api/pedidos", {
+        method: "POST",
+        body: {
+          parceiro: Number(parceiroPedido),
+          data_pedido: rascunho.dataPedido,
+          vendedor: Number(rascunho.vendedorCodigo),
+          codcondrec: Number(rascunho.condicaoPagamentoId),
+          forma: Number(rascunho.formaPagamentoId),
+          operador: Number(session?.codigo),
+          codfilial: 1,
+          obs_pedido: rascunho.observacao ?? "",
+          cliente_diversos: rascunho.clienteDiversos,
+          cliente_diversos_data: dadosClienteDiversos,
+          itens: rascunho.itens.map((item, index) => ({
+            item: index + 1,
+            codproduto: Number(item.produtoId),
+            codproduto_clas: Number(pick(item.raw, "CODPRODUTO_CLAS", "CODPRODUTOCLAS", "CLASSIFICACAO") ?? 1),
+            qtd_pedido: item.quantidade,
+            preco: item.precoUnitario,
+            valor_bruto: item.quantidade * (item.precoOriginal ?? item.precoUnitario),
+            valor_acrescimo: 0,
+            valor_desconto: (item.descontoValor ?? 0) * item.quantidade,
+            valor_liquido: item.quantidade * item.precoUnitario,
+            descricao_unmed: item.unidade ?? "UN",
+            und_medida: item.unidade ?? "UN",
+            qtd_unmed: 1,
+            obs_item: "",
+          })),
+          parcelas: parcelas.map((parcela) => ({
+            parcela: parcela.numero,
+            data_vencimento: parcela.vencimento,
+            valor: parcela.valor,
+            forma: Number(rascunho.formaPagamentoId),
+          })),
+        },
+      });
       const { error } = await supabase.from("pedidos").insert({
         operador: rascunho.vendedorCodigo ?? session!.codigo,
         operador_nome: rascunho.vendedorNome ?? session!.nome,
@@ -442,7 +508,7 @@ function PedidoEditor({
         acrescimo: totais.acrescimo,
         total: totais.total,
         parcelas: parcelas as any,
-        observacao: rascunho.observacao,
+        observacao: obsPedido,
       });
       if (error) throw error;
       toast.success("Pedido gravado!", {
@@ -544,6 +610,9 @@ function PedidoEditor({
                     <Info className="h-4 w-4" /> Detalhes
                   </Button>
                 )}
+                <Button variant="outline" size="sm" onClick={() => setCadastroClienteOpen(true)} className="gap-2">
+                  <UserPlus className="h-4 w-4" /> Cadastrar cliente
+                </Button>
                 <Button variant="outline" size="sm" onClick={() => setEntregaOpen(true)} className="gap-2">
                   <MapPin className="h-4 w-4" /> End. Entrega / Propriedade
                 </Button>
@@ -1098,6 +1167,16 @@ function PedidoEditor({
         open={cadastroDetalhesOpen}
         onOpenChange={setCadastroDetalhesOpen}
         parceiro={rascunho.clienteRaw}
+      />
+      <ClienteCadastroDialog
+        open={cadastroClienteOpen}
+        onOpenChange={setCadastroClienteOpen}
+        parceiros={parceirosQ.data ?? []}
+        onExisting={handleClienteSelect}
+        onCreated={(parceiro) => {
+          handleClienteSelect(parceiro);
+          toast.success("Cliente cadastrado e selecionado no pedido.");
+        }}
       />
 
 

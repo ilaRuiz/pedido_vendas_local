@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/table";
 import { useCompanyStore } from "@/stores/company-store";
 import { supabase } from "@/integrations/supabase/client";
-import { apiCall, getCachedPayload, setCachedPayload, mergePayload } from "@/lib/api-client";
+import { apiCall, getCachedPayload, setCachedPayload, setLargeCachedPayload, mergePayload } from "@/lib/api-client";
 import { format } from "date-fns";
 
 export const Route = createFileRoute("/app/config")({
@@ -341,7 +341,11 @@ function SyncTab() {
       const res = await apiCall<any[]>(rota, { since });
       const arr = Array.isArray(res) ? res : [];
       const merged = opts.full ? arr : mergePayload(previous, arr);
-      await setCachedPayload(rota, merged);
+      if (rota === "/api/parceiros" || rota === "/api/estoque") {
+        await setLargeCachedPayload(rota, opts.full ? arr : merged);
+      } else {
+        await setCachedPayload(rota, merged);
+      }
       const patch = {
         rota,
         last_sync_at: new Date().toISOString(),
